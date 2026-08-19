@@ -61,7 +61,7 @@ export default function App() {
       });
       if (!res.ok) {
         const text = await res.text();
-        let data = {};
+        let data: any = {};
         try { data = JSON.parse(text); } catch (e) {}
         throw new Error(data.error || 'Failed to add torrent');
       }
@@ -172,7 +172,7 @@ export default function App() {
                           <span className={torrent.done ? "text-emerald-600 font-medium" : "text-blue-600"}>
                             {torrent.done ? 'Completed' : 'Downloading'}
                           </span>
-                          {!torrent.done && `â ${formatBytes(torrent.downloadSpeed)}/s`}
+                          {!torrent.done && `• ${formatBytes(torrent.downloadSpeed)}/s`}
                         </span>
                         <span>{torrent.numPeers} peers</span>
                       </div>
