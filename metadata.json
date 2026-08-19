@@ -1,0 +1,6 @@
+{
+  "name": "Torrent Fetcher",
+  "description": "Download torrents from magnet links and serve them over HTTP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
