@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import os from 'os';
 import { createServer as createViteServer } from 'vite';
 import WebTorrent from 'webtorrent';
 import fs from 'fs';
@@ -8,7 +9,32 @@ import mime from 'mime-types';
 import ffmpeg from 'fluent-ffmpeg';
 
 const client = new WebTorrent();
-const DOWNLOAD_DIR = '/tmp/downloads';
+
+// CRITICAL: WebTorrent emits 'error' on the client when a torrent has no error
+// listener. Without this handler, a single bad/duplicate magnet or network error
+// throws an uncaught exception and crashes the entire server process.
+client.on('error', (err: any) => {
+  console.error('WebTorrent client error:', err && err.message ? err.message : err);
+});
+
+// Extra public trackers appended to every torrent to dramatically improve peer
+// discovery (many magnets ship with dead or too-few trackers).
+const DEFAULT_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.tracker.cl:1337/announce',
+  'udp://open.demonii.com:1337/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://tracker.dler.org:6969/announce',
+  'udp://open.stealth.si:80/announce',
+  'wss://tracker.openwebtorrent.com',
+  'wss://tracker.btorrent.xyz',
+];
+
+// Use the OS temp dir so this works on Windows and Linux alike (resolves to
+// /tmp on Cloud Run, %TEMP% locally).
+const DOWNLOAD_DIR = path.join(os.tmpdir(), 'torrent-downloads');
 const activeRemuxes = new Map<string, Promise<void>>();
 
 if (!fs.existsSync(DOWNLOAD_DIR)) {
@@ -45,23 +71,45 @@ async function startServer() {
   // API endpoints
   app.post('/api/torrent', async (req, res) => {
     const { magnetURI } = req.body;
-    if (!magnetURI) {
-      return res.status(400).json({ error: 'magnetURI is required' });
+    const torrentId = typeof magnetURI === 'string' ? magnetURI.trim() : '';
+    if (!torrentId) {
+      return res.status(400).json({ error: 'A magnet link or info hash is required' });
+    }
+
+    // Accept magnet URIs, bare info hashes (40-char hex / 32-char base32), or
+    // http(s) links to a .torrent file. Reject anything else up front so a stray
+    // search phrase or page URL never reaches WebTorrent.
+    const isMagnet = /^magnet:\?/i.test(torrentId);
+    const isInfoHash = /^[a-fA-F0-9]{40}$/.test(torrentId) || /^[a-zA-Z2-7]{32}$/.test(torrentId);
+    const isTorrentUrl = /^https?:\/\/.+/i.test(torrentId);
+    if (!isMagnet && !isInfoHash && !isTorrentUrl) {
+      return res.status(400).json({ error: 'That does not look like a magnet link, info hash, or .torrent URL.' });
     }
 
     try {
-      // Check if torrent already exists
-      const existingTorrent = await client.get(magnetURI);
+      // Check if torrent already exists (avoids the "duplicate torrent" error)
+      const existingTorrent = await client.get(torrentId);
       if (existingTorrent) {
         return res.json({ message: 'Torrent already downloading', infoHash: existingTorrent.infoHash });
       }
 
-      const torrent = await client.add(magnetURI, { path: DOWNLOAD_DIR });
-      console.log(`Torrent added: ${torrent.name}`);
+      // add() returns the Torrent synchronously so we can attach an error
+      // listener immediately — otherwise a torrent error bubbles to the client
+      // and (with no listener) crashes the process.
+      const torrent = client.add(torrentId, { path: DOWNLOAD_DIR, announce: DEFAULT_TRACKERS });
+
+      torrent.on('error', (err: any) => {
+        console.error(`Torrent error (${torrent.infoHash || 'unknown'}):`, err && err.message ? err.message : err);
+      });
+      torrent.on('warning', () => { /* swallow tracker warnings, they are noisy and non-fatal */ });
+      torrent.on('metadata', () => console.log(`Metadata received: ${torrent.name}`));
+      torrent.on('ready', () => console.log(`Torrent ready: ${torrent.name} (${torrent.files.length} files)`));
+
+      console.log(`Torrent added: ${torrent.infoHash}`);
       res.json({ message: 'Torrent added', infoHash: torrent.infoHash });
     } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: 'Failed to add torrent' });
+      console.error('Failed to add torrent:', error);
+      res.status(500).json({ error: 'Failed to add torrent. Check that the magnet link is valid.' });
     }
   });
 
@@ -181,8 +229,7 @@ async function startServer() {
         stream.pipe(res);
       }
     } catch (err) {
-      console.error(err);
-      fs.writeFileSync('/tmp/last-error.txt', String(err && err.stack ? err.stack : err));
+      console.error('Download error:', err);
       res.status(500).send('Internal Server Error');
     }
   });
@@ -244,7 +291,6 @@ async function startServer() {
       }
     } catch (err) {
       console.error('Stream error:', err);
-      fs.writeFileSync('/tmp/stream-error.txt', String(err && err.stack ? err.stack : err));
       res.status(500).send('Internal Server Error');
     }
   });
